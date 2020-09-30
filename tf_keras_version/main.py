@@ -9,6 +9,12 @@ import arch
 import nsml
 from nsml.constants import DATASET_PATH, GPU_NUM 
 import math
+import tensorflow.keras as keras
+import sklearn 
+from sklearn.model_selection import train_test_split
+from sklearn.utils import shuffle
+from tensorflow.keras.utils import to_categorical
+
 
 ######################## DONOTCHANGE ###########################
 def bind_model(model):
@@ -24,7 +30,7 @@ def bind_model(model):
     def infer(image_path):
         result = []
         X = PathDataset(image_path, labels=None, batch_size = batch_size)
-        y_hat = model.predict(X)            
+        y_hat = model.predict(X)
         result.extend(np.argmax(y_hat, axis=1))
 
         print('predicted')
@@ -65,11 +71,15 @@ class PathDataset(tf.keras.utils.Sequence):
         self.labels = labels
         self.mode = test_mode
         self.batch_size = batch_size
+        
+    def load_image(self, image_path):
+        img = map_func(image_path, None)
+        return img
 
     def __getitem__(self, idx): 
         image_paths = self.image_path[idx * self.batch_size:(idx + 1) * self.batch_size]
-        batch_x = np.array([imread(x) for x in image_paths])
-        
+        batch_x = np.array([self.load_image(x) for x in image_paths])
+        batch_x = prep_func(batch_x)
                 ### REQUIRED: PREPROCESSING ###
 
         if self.mode:
@@ -81,6 +91,30 @@ class PathDataset(tf.keras.utils.Sequence):
     def __len__(self):
         return math.ceil(len(self.image_path) / self.batch_size)
 
+def map_func(image_path, cap):
+    img = tf.io.read_file(image_path)
+    img = tf.image.decode_jpeg(img, channels=3)
+#     img = tf.dtypes.cast(img, tf.float32)
+    img = tf.image.resize(img, (300, 300))
+    
+#     cap_onehot = keras.utils.to_categorical(
+#         cap, num_classes=2, dtype='float32'
+#     )
+
+    return img, cap 
+
+def prep_func(image, cap):
+#     result_image = tf.keras.applications.resnet_v2.preprocess_input(image)
+    result_image = image
+    result_image -= tf.keras.backend.mean(
+        result_image, axis=0, keepdims=True
+    )
+    result_image /= (tf.keras.backend.std(
+        result_image, axis=0, keepdims=True
+    )+1e-9)
+    
+    return result_image, cap    
+    
 if __name__ == '__main__':
 
     ########## ENVIRONMENT SETUP ############
@@ -94,9 +128,9 @@ if __name__ == '__main__':
     ######################################################################
 
     # hyperparameters
-    args.add_argument('--epoch', type=int, default=1)
-    args.add_argument('--batch_size', type=int, default=16) 
-    args.add_argument('--learning_rate', type=int, default=0.0001)
+    args.add_argument('--epoch', type=int, default=100)
+    args.add_argument('--batch_size', type=int, default=128)
+    args.add_argument('--learning_rate', type=int, default=0.00005)
 
     config = args.parse_args()
 
@@ -107,13 +141,15 @@ if __name__ == '__main__':
     learning_rate = config.learning_rate  
 
     # model setting ## 반드시 이 위치에서 로드해야함
-    model = arch.cnn() 
+    model = arch.ResNet50() # ResNet50, MobileNetV2, 
 
     # Loss and optimizer
-    model.compile(tf.keras.optimizers.Adam(),
-                loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
-                metrics=['accuracy'])
-
+    model.compile(
+        tf.keras.optimizers.Adam(),
+#         loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
+        loss=tf.keras.losses.CategoricalCrossentropy(),
+        metrics=['accuracy']
+    )
 
     ############ DONOTCHANGE ###############
     bind_model(model)
@@ -130,11 +166,36 @@ if __name__ == '__main__':
         image_keys, image_path = path_loader(root_path)
         labels = label_loader(root_path, image_keys)
         ##############################################
+        
+#         X = PathDataset(image_path, labels, batch_size = batch_size, test_mode=False)
 
-        X = PathDataset(image_path, labels, batch_size = batch_size, test_mode=False)
+        labels_onehot = np.array([to_categorical(label, 2) for label in labels])
+        img_name_train, img_name_val, cap_train, cap_val = train_test_split(image_path, labels_onehot, test_size=0.2, random_state=2718)
+
+        dataset_train = tf.data.Dataset.from_tensor_slices((img_name_train, cap_train))
+        dataset_train = dataset_train.map(map_func, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        dataset_train = dataset_train.batch(batch_size)
+        dataset_train = dataset_train.map(prep_func, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        dataset_train = dataset_train.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+    
+        dataset_val = tf.data.Dataset.from_tensor_slices((img_name_val, cap_val))
+        dataset_val = dataset_val.map(map_func, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        dataset_val = dataset_val.batch(batch_size)
+        dataset_val = dataset_val.map(prep_func, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        dataset_val = dataset_val.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
  
         for epoch in range(num_epochs):
-            hist = model.fit(X, shuffle=True)        
+            print('=== Epoch: {:06d} ==='.format(epoch))
+            hist = model.fit(
+                dataset_train,
+                validation_data=dataset_val, 
+                shuffle=True,
+#                 batch_size=config['batch_size']                
+            )
 
-            nsml.report(summary=True, step=epoch, epoch_total=num_epochs, loss=hist.history['loss'])#, acc=train_acc)
+            nsml.report(
+                summary=True, step=epoch, epoch_total=num_epochs, 
+                loss=hist.history['loss'], accuracy=hist.history['accuracy'],
+                val_loss=hist.history['val_loss'], val_accuracy=hist.history['val_accuracy'],
+            )#, acc=train_acc)
             nsml.save(epoch)
